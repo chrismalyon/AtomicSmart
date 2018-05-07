@@ -38,7 +38,7 @@ boolean ignoreserver = false;
 
 String Host = "AtomicSmart";
 const char* update_username = "admin";
-const char* update_password = "Kenwood1";
+const char* update_password = "*****";
 const char* update_path = "/firmware";
 ESP8266HTTPUpdateServer httpUpdater;
 
@@ -85,8 +85,8 @@ const char* ssid = "AtomicSmart1";
 
 const char* password = "welcomehome";
 
-//const char* mqtt_server = "mqtt.malyon.co.uk";
-const char* mqtt_server = "mqtt.malyon.co.uk";
+
+const char* mqtt_server = "************";
 
 char NRValue[8];
 String MainTopic;
