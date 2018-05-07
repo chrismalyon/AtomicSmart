@@ -8,15 +8,26 @@
 #include <EEPROM.h>
 #include "htmlhead.h"
 #include <ESP8266HTTPUpdateServer.h>
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define OLED_RESET 0  // GPIO0
+Adafruit_SSD1306 display(OLED_RESET);
+
+#define ONE_WIRE_BUS D2
+OneWire ds(ONE_WIRE_BUS);
 
 IPAddress ipMulti(239, 255, 255, 250);
 const unsigned int portMulti = 1900;
 char packetBuffer[512];
 
-#define MAX_SWITCHES 14
-int numOfSwitchs = 0;
+#define PIN            D6
+#define NUMPIXELS      2
 
 WiFiUDP UDP;
+
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
 const int relayPin = D1;
 const int buttonPin = D2;
@@ -27,7 +38,7 @@ boolean ignoreserver = false;
 
 String Host = "AtomicSmart";
 const char* update_username = "admin";
-const char* update_password = "*******";
+const char* update_password = "Kenwood1";
 const char* update_path = "/firmware";
 ESP8266HTTPUpdateServer httpUpdater;
 
@@ -54,6 +65,11 @@ String Gdevname = "";
 boolean GAlexa = false;
 boolean GMQTT = false;
 boolean GLED = false;
+boolean GNeoPixel = false;
+String GPixelcolor = "#45bc00";
+int GDevtype = 1;
+
+long Gcelsius = 0.00;
 
 long mqttpreviousMillis = 0;
 long mqttinterval = 10000;
@@ -61,13 +77,16 @@ long mqttinterval = 10000;
 long buttonpresspreviousMillis = 0;
 long buttonpressinterval = 3000;
 
-
+long previousMillis = 0;
+long interval = 60000;
+boolean firstrunDS = true;
 
 const char* ssid = "AtomicSmart1";
 
-const char* password = "welcomeAtomicSmart";
+const char* password = "welcomehome";
 
-const char* mqtt_server = "mqtt.Server.co.uk";
+//const char* mqtt_server = "mqtt.malyon.co.uk";
+const char* mqtt_server = "mqtt.malyon.co.uk";
 
 char NRValue[8];
 String MainTopic;
@@ -77,6 +96,10 @@ const long postDelay = 200;  // pause for 200 milliseconds after toggling to Ope
 int value = 0;
 boolean relayState;
 boolean lastrelaystate;
+
+boolean DBellState;
+boolean lastDBellState;
+
 unsigned long PayloadTime = millis();
 static unsigned long last_PayloadTime = 0;
 
@@ -131,29 +154,142 @@ void buttonPress()
     ignoreserver = true;
     last_interrupt_time = millis();
     Serial.println("Button Pressed");
-    if (relayState == LOW) {
-      digitalWrite(relayPin, HIGH); // turn on relay with voltage HIGH
-      relayState = true;
-      if (GLED){
-      digitalWrite(LEDPin, LOW);
+    if (GDevtype == 2) {
+      if (relayState == LOW) {
+        digitalWrite(relayPin, HIGH); // turn on relay with voltage HIGH
+        relayState = true;
+        if (GLED) {
+          digitalWrite(LEDPin, LOW);
+        }
+      } else if (relayState == HIGH) {
+        digitalWrite(relayPin, LOW); // turn on relay with voltage HIGH
+        relayState = false;
+        if (GLED) {
+          digitalWrite(LEDPin, HIGH);
+        }
       }
-
-
-
-    } else if (relayState == HIGH) {
-      digitalWrite(relayPin, LOW); // turn on relay with voltage HIGH
-      relayState = false;
-      if (GLED){
-      digitalWrite(LEDPin, HIGH);
+    } if (GDevtype == 3) {
+      if (DBellState == true) {
+        DBellState = false;
+      } else if (DBellState == false) {
+        DBellState = true;
       }
-
     }
-
   }
 
 
 }
 
+void handlesettings() {
+  String qsid = server.arg("ssid");
+  String qpass = server.arg("pass");
+  String mqtthost = server.arg("mqtthost");
+  String mqttport = server.arg("mqttport");
+  String mqttuser = server.arg("mqttuser");
+  String mqttpass = server.arg("mqttpass");
+  String devname = server.arg("devname");
+
+  int Devtype = server.arg("Devtype").toInt();
+  boolean Alexa;
+  if (GDevtype == 1 ) {
+    Alexa = false;
+  } else {
+    if (server.arg("Alexa") == "1") {
+      Alexa = true;
+    } else if (server.arg("Alexa") == "0") {
+      Alexa = false;
+    }
+  }
+
+  boolean MQTT;
+  if (server.arg("MQTT") == "1") {
+    MQTT = true;
+  } else if (server.arg("MQTT") == "0") {
+    MQTT = false;
+  }
+
+  boolean NeoPixel;
+  if (GDevtype == 1 ) {
+    NeoPixel = false;
+  } else {
+    if (server.arg("NeoPixel") == "1") {
+      NeoPixel = true;
+    } else if (server.arg("NeoPixel") == "0") {
+      NeoPixel = false;
+    }
+  }
+
+  boolean LED;
+  if (server.arg("LED") == "1") {
+    LED = true;
+  } else if (server.arg("LED") == "0") {
+    LED = false;
+  }
+
+
+
+  if (qsid.length() > 0 && qpass.length() > 0) {
+    Serial.println("clearing eeprom");
+    for (int i = 0; i < 512; ++i) {
+      EEPROM.write(i, 0);
+    }
+
+
+    for (int i = 0; i < 32; ++i)
+    {
+      EEPROM.write(i, qsid.charAt(i));
+    }
+    for (int i = 32; i < 96; ++i)
+    {
+      EEPROM.write(i, qpass.charAt(i - 32));
+    }
+    for (int i = 96; i < 128; ++i)
+    {
+      EEPROM.write(i, mqtthost.charAt(i - 96));
+    }
+    for (int i = 128; i < 160; ++i)
+    {
+      EEPROM.write(i, mqttport.charAt(i - 128));
+    }
+    for (int i = 160; i < 192; ++i)
+    {
+      EEPROM.write(i, mqttuser.charAt(i - 160));
+    }
+    for (int i = 192; i < 224; ++i)
+    {
+      EEPROM.write(i, mqttpass.charAt(i - 192));
+    }
+    for (int i = 224; i < 256; ++i)
+    {
+      EEPROM.write(i, devname.charAt(i - 224));
+    }
+
+    EEPROM.write(257, Alexa);
+    EEPROM.write(258, MQTT);
+    EEPROM.write(259, LED);
+    EEPROM.write(260, NeoPixel);
+    EEPROM.write(269, Devtype);
+
+    Serial.print("Saving Device Type: ");
+    Serial.println(Devtype);
+
+    EEPROM.commit();
+    loadSettingsFromEEPROM(false);
+
+    content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
+    statusCode = 200;
+  } else {
+    content = "{\"Error\":\"404 not found\"}";
+    statusCode = 404;
+    Serial.println("Sending 404");
+  }
+
+  content = HTMLhead;
+  content += "<h3>Please Restart the Device </h3></body></html>";
+  server.sendContent(content);
+  //        digitalWrite(D3,HIGH);
+  //ESP.reset();
+}
 
 void handleRoot() {
   //  digitalWrite ( led, 1 );
@@ -165,13 +301,46 @@ void handleRoot() {
 
   String messageBody = HTMLhead;
 
-  messageBody += "<div class=\"tab\">\
-  <button class=\"tablinks\" onclick=\"openTab(event, 'Home')\">Home</button>\
-  <button class=\"tablinks\" onclick=\"openTab(event, 'Settings')\">Settings</button>\
-  <button class=\"tablinks\" onclick=\"openTab(event, 'Update')\">Update</button>\
-  </div>";
+  messageBody += "<div class=\"tab\">";
+  messageBody += "<button class=\"tablinks\" onclick=\"openTab(event, 'Home')\">Home</button>";
+  messageBody += "<button class=\"tablinks\" onclick=\"openTab(event, 'Settings')\">Settings</button>";
+  if (GNeoPixel) {
+    messageBody += "<button class=\"tablinks\" onclick=\"openTab(event, 'NeoPixel')\">NeoPixel</button>";
+  }
+  messageBody += "<button class=\"tablinks\" onclick=\"openTab(event, 'Update')\">Update</button>";
+  messageBody += "</div>";
+
   messageBody += "<div id=\"Settings\" class=\"tabcontent\"><h3>Settings</h3>";
   messageBody += "<table width=\"800px\">";
+  messageBody += "<form method='get' action='setting'>";
+
+  messageBody += "<tr><td>Device Type:</td><td>";
+
+  messageBody += "<select name=\"Devtype\">";
+  messageBody += "<option value=\"1\"";
+  if (GDevtype == 1) {
+    messageBody += "selected";
+  }
+  messageBody += ">Socket</option>";
+  messageBody += "<option value=\"2\"";
+  if (GDevtype == 2) {
+    messageBody += "selected";
+  }
+  messageBody += ">Light Switch</option>";
+
+  messageBody += "<option value=\"3\"";
+  if (GDevtype == 3) {
+    messageBody += "selected";
+  }
+  messageBody += ">DoorBell</option>";
+  messageBody += "<option value=\"4\"";
+  if (GDevtype == 4) {
+    messageBody += "selected";
+  }
+  messageBody += ">Thermostat</option>";
+  messageBody += "</select></td></tr>";
+
+
   messageBody += "<tr><td>Enable MQTT Support:</td><td>";
 
   if (GMQTT) {
@@ -189,7 +358,7 @@ void handleRoot() {
   }
 
   messageBody += "</td></tr>";
-  messageBody += "<form method='get' action='setting'><tr><td align=\"centre\"><label>Wifi SSID: </label></td><td align=\"centre\"><input name='ssid' length=32 value='";
+  messageBody += "<tr><td align=\"centre\"><label>Wifi SSID: </label></td><td align=\"centre\"><input name='ssid' length=32 value='";
   messageBody += Gqsid;
   messageBody += "' required></td><td align=\"centre\"><label>Wifi Password: </label></td><td align=\"centre\"><input name='pass' length=32 value='";
   messageBody += Gqpass;
@@ -207,20 +376,38 @@ void handleRoot() {
   messageBody += "<tr><td align=\"centre\"><label>Device Name: </label></td><td align=\"centre\"><input name='devname' length=32 value='";
   messageBody += Gdevname;
   messageBody += "' required></td></tr>";
-  messageBody += "'<tr><td>Enable Alexa Support:</td><td>";
 
-  if (GAlexa) {
-    messageBody += "<input type=\"hidden\" name=\"Alexa\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
+  if (GDevtype == 2 || GDevtype == 1 ) {
+    messageBody += "<tr><td>Enable Alexa Support:</td><td>";
+    if (GAlexa) {
+      messageBody += "<input type=\"hidden\" name=\"Alexa\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
+    } else {
+      messageBody += "<input type=\"hidden\" name=\"Alexa\" value=\"0\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\">";
+    }
+    messageBody += "</td>";
+
   } else {
-    messageBody += "<input type=\"hidden\" name=\"Alexa\" value=\"0\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\">";
+    messageBody += "<input type=\"hidden\" name=\"Alexa\" value=\"0\">";
+  }
+  if (GDevtype == 2 || GDevtype == 3 ) {
+    messageBody += "<td>Enable Neopixel:</td><td>";
+
+    if (GNeoPixel) {
+      messageBody += "<input type=\"hidden\" name=\"NeoPixel\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
+    } else {
+      messageBody += "<input type=\"hidden\" name=\"NeoPixel\" value=\"0\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\">";
+    }
+
+    messageBody += "</td></tr>";
+  } else {
+    messageBody += "<input type=\"hidden\" name=\"NeoPixel\" value=\"0\">";
+
   }
 
-  messageBody += "</td></tr>";
-  messageBody += "<tr><td></td><td></td><td></td><td align=\"centre\"></td></tr>";
   messageBody += "<tr><td></td></tr>";
 
 
-  messageBody += "'<tr><td>Enable Status LED:</td><td>";
+  messageBody += "<tr><td>Enable Status LED:</td><td>";
 
   if (GLED) {
     messageBody += "<input type=\"hidden\" name=\"LED\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
@@ -237,17 +424,25 @@ void handleRoot() {
   messageBody += "<tr><td><form method='get' action='factoryreset'><label>Factory Reset: </label><input type='hidden' name='reset' value='true'></td><td><input type='button' onClick=\"confSubmit(this.form);\" value='Reset'></form><br></td></tr></table></div>";
 
   messageBody += "<div id=\"Home\" class=\"tabcontent\"><h3>Home</h3>";
-
-  messageBody += "<form method='get' action='switchaction'><label>Switch State: </label>";
-  messageBody += "<label class=\"switch\">";
-  //messageBody += "<input name='switchstate' type=\"checkbox\" value=\"1\">";
-  if (relayState) {
-    messageBody += "<input type=\"hidden\" name=\"switchstate\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
-  } else {
-    messageBody += "<input type=\"hidden\" name=\"switchstate\" value=\"0\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\">";
+  if (GDevtype == 1 || GDevtype == 2) {
+    messageBody += "<form method='get' action='switchaction'><label>Switch State: </label>";
+    messageBody += "<label class=\"switch\">";
+    //messageBody += "<input name='switchstate' type=\"checkbox\" value=\"1\">";
+    if (relayState) {
+      messageBody += "<input type=\"hidden\" name=\"switchstate\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
+    } else {
+      messageBody += "<input type=\"hidden\" name=\"switchstate\" value=\"0\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\">";
+    }
+    messageBody += "<span class=\"slider round\"></span>";
+    messageBody += "</label><input type='submit'></form>";
+  } else if (GDevtype == 3) {
+    messageBody += "Device is in Doorbell Mode";
+  } else if (GDevtype == 4) {
+    messageBody += "Temperature: ";
+    messageBody += Gcelsius;
+    messageBody += "&deg<br>";
   }
-  messageBody += "<span class=\"slider round\"></span>";
-  messageBody += "</label><input type='submit'></form>";
+
   messageBody += "</div>";
 
 
@@ -257,7 +452,17 @@ void handleRoot() {
   messageBody += "<form id='data' action='/firmware' method='POST' enctype='multipart/form-data'>";
   messageBody += "<input type='file' accept='.bin' class='custom-file-input' id='inputGroupFile04' name='update'><label class='custom-file-label' for='inputGroupFile04'>Choose file</label></td><td><button class='btn btn-danger' type='submit'>Update!</button><td></tr>";
   messageBody += "<tr><td><button type='button' class='btn btn-Primary' onclick='window.location.href=\"/\"'>Back</button></td></td>";
-  messageBody += "</form></table></div></main></body></html>";
+  messageBody += "</form></table></div>";
+
+
+  messageBody += "<div id=\"NeoPixel\" class=\"tabcontent\"><h3>NeoPixel</h3>";
+  messageBody += "<form method='get' action='neopixel'>";
+  messageBody += "<table><tr><td>";
+  messageBody += "<input type=\"color\" name=\"pixelcolor\" value=\"";
+  messageBody += GPixelcolor;
+  messageBody += "\"></td>";
+  messageBody += "<td><input type=\"submit\"></td></tr>";
+  messageBody += "</form></table></div>";
 
 
   messageBody += "<script> openTab(event, \"Home\")</script></body>";
@@ -301,13 +506,17 @@ void setup() {
   pinMode(LEDPin, OUTPUT);
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(D3, OUTPUT);
-  
-  digitalWrite(LEDPin, HIGH);
 
+  digitalWrite(LEDPin, HIGH);
+  if (GDevtype == 2 || GDevtype == 3 ) {
+    pixels.begin(); // This initializes the NeoPixel library.
+  }
   Serial.print("Connecting to ");
   Serial.println(ssid);
   Serial.println("Startup");
   // read eeprom for ssid and pass
+
+
   Serial.println("Reading EEPROM");
   loadSettingsFromEEPROM(false);
   String esid = Gqsid;
@@ -317,8 +526,21 @@ void setup() {
   Serial.print("PASS: ");
   Serial.println(epass);
 
-  attachInterrupt(digitalPinToInterrupt(buttonPin), buttonPress, FALLING);
+  if (GDevtype == 2 || GDevtype == 3 ) {
+    attachInterrupt(digitalPinToInterrupt(buttonPin), buttonPress, FALLING);
+  }
 
+
+  if (GDevtype == 4) {
+    display.begin(SSD1306_SWITCHCAPVCC, 0x3C);  // initialize with the I2C addr 0x3C (for the 64x48)
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(30, 10);
+    display.println("AtomicSmart");
+    display.println(millis());
+    display.display();
+  }
 
   uint32_t uniqueSwitchId = ESP.getChipId() + 80;
   char uuid[64];
@@ -393,6 +615,20 @@ void setup() {
         }
       });
 
+      server.on("/neopixel", [&]() {
+        String pixelcolor = server.arg("pixelcolor");
+        Serial.print("Pixel Colour: ");
+        Serial.println(pixelcolor);
+        for (int i = 261; i < 268; ++i)
+        {
+          EEPROM.write(i, pixelcolor.charAt(i - 261));
+        }
+        EEPROM.commit();
+        GPixelcolor = pixelcolor;
+        content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
+        server.sendContent(content);
+      });
+
       if (GAlexa) {
 
         server.on("/setup.xml", [&]() {
@@ -421,97 +657,17 @@ void setup() {
 
 
       }
-      server.on("/setting", []() {
-        String qsid = server.arg("ssid");
-        String qpass = server.arg("pass");
-        String mqtthost = server.arg("mqtthost");
-        String mqttport = server.arg("mqttport");
-        String mqttuser = server.arg("mqttuser");
-        String mqttpass = server.arg("mqttpass");
-        String devname = server.arg("devname");
-        boolean Alexa;
-        if (server.arg("Alexa") == "1") {
-          Alexa = true;
-        } else if (server.arg("Alexa") == "0") {
-          Alexa = false;
-        }
-        boolean MQTT;
-        if (server.arg("MQTT") == "1") {
-          MQTT = true;
-        } else if (server.arg("MQTT") == "0") {
-          MQTT = false;
-        }
-
-        if (qsid.length() > 0 && qpass.length() > 0) {
-          Serial.println("clearing eeprom");
-          for (int i = 0; i < 512; ++i) {
-            EEPROM.write(i, 0);
-          }
-          boolean LED;
-          if (server.arg("LED") == "1") {
-            LED = true;
-          } else if (server.arg("LED") == "0") {
-            LED = false;
-          }
-
-
-          for (int i = 0; i < 32; ++i)
-          {
-            EEPROM.write(i, qsid.charAt(i));
-          }
-          for (int i = 32; i < 96; ++i)
-          {
-            EEPROM.write(i, qpass.charAt(i - 32));
-          }
-          for (int i = 96; i < 128; ++i)
-          {
-            EEPROM.write(i, mqtthost.charAt(i - 96));
-          }
-          for (int i = 128; i < 160; ++i)
-          {
-            EEPROM.write(i, mqttport.charAt(i - 128));
-          }
-          for (int i = 160; i < 192; ++i)
-          {
-            EEPROM.write(i, mqttuser.charAt(i - 160));
-          }
-          for (int i = 192; i < 224; ++i)
-          {
-            EEPROM.write(i, mqttpass.charAt(i - 192));
-          }
-          for (int i = 224; i < 256; ++i)
-          {
-            EEPROM.write(i, devname.charAt(i - 224));
-          }
-
-          EEPROM.write(257, Alexa);
-          EEPROM.write(258, MQTT);
-          EEPROM.write(259, LED);
-
-          EEPROM.commit();
-          loadSettingsFromEEPROM(false);
-
-          content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
-          statusCode = 200;
-        } else {
-          content = "{\"Error\":\"404 not found\"}";
-          statusCode = 404;
-          Serial.println("Sending 404");
-        }
-        content = HTMLhead;
-        content += "<h3>Please Restart the Device </h3></body></html>";
-        server.sendContent(content);
-        //        digitalWrite(D3,HIGH);
-        //ESP.reset();
-      });
+      server.on("/setting", handlesettings);
 
       server.on("/switchaction", []() {
-        Serial.println(server.arg("switchstate"));
-        if (server.arg("switchstate") == "1") {
-          turnOnRelay(true);
-        }
-        if (server.arg("switchstate") == "0") {
-          turnOffRelay(true);
+        if (GDevtype == 1 || GDevtype == 2) {
+          Serial.println(server.arg("switchstate"));
+          if (server.arg("switchstate") == "1") {
+            turnOnRelay(true);
+          }
+          if (server.arg("switchstate") == "0") {
+            turnOffRelay(true);
+          }
         }
         content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
         server.sendContent(content);
@@ -585,87 +741,7 @@ void setup() {
 
     }
   });
-  server.on("/setting", []() {
-    String qsid = server.arg("ssid");
-    String qpass = server.arg("pass");
-    String mqtthost = server.arg("mqtthost");
-    String mqttport = server.arg("mqttport");
-    String mqttuser = server.arg("mqttuser");
-    String mqttpass = server.arg("mqttpass");
-    String devname = server.arg("devname");
-    boolean Alexa;
-    if (server.arg("Alexa") == "1") {
-      Alexa = true;
-    } else if (server.arg("Alexa") == "0") {
-      Alexa = false;
-    }
-    boolean MQTT;
-    if (server.arg("MQTT") == "1") {
-      MQTT = true;
-    } else if (server.arg("MQTT") == "0") {
-      MQTT = false;
-    }
-    boolean LED;
-    if (server.arg("LED") == "1") {
-      LED = true;
-    } else if (server.arg("LED") == "0") {
-      LED = false;
-    }
-
-    if (qsid.length() > 0 && qpass.length() > 0) {
-      Serial.println("clearing eeprom");
-      for (int i = 0; i < 512; ++i) {
-        EEPROM.write(i, 0);
-      }
-
-
-
-      for (int i = 0; i < 32; ++i)
-      {
-        EEPROM.write(i, qsid.charAt(i));
-      }
-      for (int i = 32; i < 96; ++i)
-      {
-        EEPROM.write(i, qpass.charAt(i - 32));
-      }
-      for (int i = 96; i < 128; ++i)
-      {
-        EEPROM.write(i, mqtthost.charAt(i - 96));
-      }
-      for (int i = 128; i < 160; ++i)
-      {
-        EEPROM.write(i, mqttport.charAt(i - 128));
-      }
-      for (int i = 160; i < 192; ++i)
-      {
-        EEPROM.write(i, mqttuser.charAt(i - 160));
-      }
-      for (int i = 192; i < 224; ++i)
-      {
-        EEPROM.write(i, mqttpass.charAt(i - 192));
-      }
-      for (int i = 224; i < 256; ++i)
-      {
-        EEPROM.write(i, devname.charAt(i - 224));
-      }
-
-      EEPROM.write(257, Alexa);
-      EEPROM.write(258, MQTT);
-      EEPROM.write(259, LED);
-
-      EEPROM.commit();
-      loadSettingsFromEEPROM(false);
-
-      content = HTMLhead;
-      content += "<h3 style=\"color:#45BC00;\">Please Restart the Device </h3></body></html>";
-      statusCode = 200;
-    } else {
-      content = "{\"Error\":\"404 not found\"}";
-      statusCode = 404;
-      Serial.println("Sending 404");
-    }
-    server.sendContent(content);
-  });
+  server.on("/setting", handlesettings);
 
   if (GAlexa) {
 
@@ -741,8 +817,8 @@ void turnOnRelay(bool report) {
       espclient.publish(("openhab/in/" + Gdevname + "/state").c_str(), "ON");
     }
   }
-  if (GLED){
-  digitalWrite(LEDPin, LOW);
+  if (GLED) {
+    digitalWrite(LEDPin, LOW);
   }
 }
 
@@ -755,8 +831,8 @@ void turnOffRelay(bool report) {
       espclient.publish(("openhab/in/" + Gdevname + "/state").c_str(), "OFF");
     }
   }
-  if (GLED){
-  digitalWrite(LEDPin, HIGH);
+  if (GLED) {
+    digitalWrite(LEDPin, HIGH);
   }
 }
 
@@ -768,10 +844,26 @@ void loop() {
   ArduinoOTA.handle();
   server.handleClient();
 
-  if (!GLED){
-      digitalWrite(LEDPin, HIGH);
+  if (!GLED) {
+    digitalWrite(LEDPin, HIGH);
   }
-  
+
+  if (GDevtype == 2 || GDevtype == 3 ) {
+    if (GNeoPixel) {
+      for (int i = 0; i < NUMPIXELS; i++) {
+        // Get rid of '#' and convert it to integer
+        int number = (int) strtol( &GPixelcolor[1], NULL, 16);
+        // Split them up into r, g, b values
+        int r = number >> 16;
+        int g = number >> 8 & 0xFF;
+        int b = number & 0xFF;
+        // pixels.Color takes RGB values, from 0,0,0 up to 255,255,255
+        pixels.setPixelColor(i, pixels.Color(r, g, b)); // Moderately bright green color.
+        pixels.show(); // This sends the updated pixel color to the hardware.
+      }
+    }
+  }
+
   if (GAlexa) {
     serverLoop();
   }
@@ -783,6 +875,13 @@ void loop() {
         espclient.publish(("openhab/in/" + Gdevname + "/state").c_str(), "OFF");
       }
       lastrelaystate = relayState;
+    }
+  }
+  if (GDevtype == 3) {
+    if ( DBellState != lastDBellState) {
+      espclient.publish(("openhab/in/" + Gdevname + "/state").c_str(), "ON");
+      Serial.println("DoorBell Pressed");
+      lastDBellState = DBellState;
     }
   }
   if (ignoreserver) {
@@ -811,6 +910,103 @@ void loop() {
     }
     delay(25);
   }
+
+  if (GDevtype == 4) {
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - previousMillis > interval || firstrunDS) {
+      previousMillis = currentMillis;
+      firstrunDS = false;
+
+      byte i;
+      byte present = 0;
+      byte type_s;
+      byte data[12];
+      byte addr[8];
+      float celsius, fahrenheit;
+
+      if ( !ds.search(addr))
+      {
+        ds.reset_search();
+        delay(250);
+        return;
+      }
+
+
+      if (OneWire::crc8(addr, 7) != addr[7])
+      {
+        Serial.println("CRC is not valid!");
+        return;
+      }
+      Serial.println();
+
+      // the first ROM byte indicates which chip
+      switch (addr[0])
+      {
+        case 0x10:
+          type_s = 1;
+          break;
+        case 0x28:
+          type_s = 0;
+          break;
+        case 0x22:
+          type_s = 0;
+          break;
+        default:
+          Serial.println("Device is not a DS18x20 family device.");
+          return;
+      }
+
+      ds.reset();
+      ds.select(addr);
+      ds.write(0x44, 1);        // start conversion, with parasite power on at the end
+      delay(1000);
+      present = ds.reset();
+      ds.select(addr);
+      ds.write(0xBE);         // Read Scratchpad
+
+      for ( i = 0; i < 9; i++)
+      {
+        data[i] = ds.read();
+      }
+
+      // Convert the data to actual temperature
+      int16_t raw = (data[1] << 8) | data[0];
+      if (type_s) {
+        raw = raw << 3; // 9 bit resolution default
+        if (data[7] == 0x10)
+        {
+          raw = (raw & 0xFFF0) + 12 - data[6];
+        }
+      }
+      else
+      {
+        byte cfg = (data[4] & 0x60);
+        if (cfg == 0x00) raw = raw & ~7;  // 9 bit resolution, 93.75 ms
+        else if (cfg == 0x20) raw = raw & ~3; // 10 bit res, 187.5 ms
+        else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
+
+      }
+      celsius = (float)raw / 16.0 - 6;
+      Gcelsius = celsius;
+
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setTextColor(WHITE);
+      display.setCursor(0, 0);
+      display.println(celsius);
+      display.display();
+
+      espclient.publish("openhab/out/RemoteTherm1/state", String(celsius).c_str());
+
+      Serial.println( String(celsius).c_str());
+
+      Serial.println("Waiting…");
+
+    }
+
+  }
+
 }
 
 void loadSettingsFromEEPROM(bool first)
@@ -859,9 +1055,23 @@ void loadSettingsFromEEPROM(bool first)
     Gdevname += char(EEPROM.read(i));
   }
 
+
   GAlexa = EEPROM.read(257);
   GMQTT = EEPROM.read(258);
   GLED = EEPROM.read(259);
+  GNeoPixel = EEPROM.read(260);
+  GDevtype = EEPROM.read(269);
+
+
+  GPixelcolor = "";
+  for (int i = 261; i < 268; ++i)
+  {
+    if (EEPROM.read(i) == 0) break;
+    GPixelcolor += char(EEPROM.read(i));
+  }
+  Serial.print("Pixel Colour: ");
+  Serial.println(GPixelcolor);
+
 }
 
 
@@ -1049,4 +1259,3 @@ void serverLoop() {
     }
   }
 }
-
