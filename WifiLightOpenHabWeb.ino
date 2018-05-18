@@ -8,12 +8,18 @@
 #include <EEPROM.h>
 #include "htmlhead.h"
 #include <ESP8266HTTPUpdateServer.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
 #define OLED_RESET 0  // GPIO0
 Adafruit_SSD1306 display(OLED_RESET);
+
+const int FW_VERSION = 1009;
+
+const char* fwUrlBase = "http://www.UPDATESERVER.co.uk/atomicsmart/";
 
 #define ONE_WIRE_BUS D2
 OneWire ds(ONE_WIRE_BUS);
@@ -68,6 +74,7 @@ boolean GLED = false;
 boolean GNeoPixel = false;
 String GPixelcolor = "#45bc00";
 int GDevtype = 1;
+boolean Gautoupdate = true;
 
 long Gcelsius = 0.00;
 
@@ -77,9 +84,13 @@ long mqttinterval = 10000;
 long buttonpresspreviousMillis = 0;
 long buttonpressinterval = 3000;
 
+long autoupdatepresspreviousMillis = 0;
+long autoupdateinterval = 60000;
+
 long previousMillis = 0;
 long interval = 60000;
 boolean firstrunDS = true;
+boolean firstrunAU = true;
 
 const char* ssid = "AtomicSmart1";
 
@@ -189,6 +200,7 @@ void handlesettings() {
   String mqttpass = server.arg("mqttpass");
   String devname = server.arg("devname");
 
+
   int Devtype = server.arg("Devtype").toInt();
   boolean Alexa;
   if (GDevtype == 1 ) {
@@ -224,6 +236,13 @@ void handlesettings() {
     LED = true;
   } else if (server.arg("LED") == "0") {
     LED = false;
+  }
+
+  boolean autoupdate;
+  if (server.arg("autoupdate") == "1") {
+    autoupdate = true;
+  } else if (server.arg("autoupdate") == "0") {
+    autoupdate = false;
   }
 
 
@@ -269,6 +288,8 @@ void handlesettings() {
     EEPROM.write(259, LED);
     EEPROM.write(260, NeoPixel);
     EEPROM.write(269, Devtype);
+    EEPROM.write(270, autoupdate);
+
 
     Serial.print("Saving Device Type: ");
     Serial.println(Devtype);
@@ -416,6 +437,15 @@ void handleRoot() {
   }
 
   messageBody += "</td></tr>";
+  messageBody += "<tr><td>Enable Auto Update:</td><td>";
+
+  if (Gautoupdate) {
+    messageBody += "<input type=\"hidden\" name=\"autoupdate\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
+  } else {
+    messageBody += "<input type=\"hidden\" name=\"autoupdate\" value=\"0\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\">";
+  }
+
+  messageBody += "</td></tr>";
   messageBody += "<tr><td></td><td></td><td></td><td align=\"centre\"><input type='submit'></form></td></tr>";
   messageBody += "<tr><td></td></tr>";
 
@@ -466,8 +496,17 @@ void handleRoot() {
 
 
   messageBody += "<script> openTab(event, \"Home\")</script></body>";
+  messageBody += "<br>Hostname: ";
+  messageBody += String(Gdevname);
+  messageBody += "<br>";
   messageBody += "<br>ESP ChipID: ";
   messageBody += String(ESP.getChipId());
+  messageBody += "<br><br>";
+  messageBody += "MAC Address: ";
+  messageBody += String(getMAC());
+  messageBody += "<br><br>";
+  messageBody += "Firmware Version: ";
+  messageBody += String( FW_VERSION );
 
   messageBody += "</html>";
   server.setContentLength(messageBody.length());
@@ -502,6 +541,9 @@ void setup() {
   EEPROM.begin(512);
   delay(10);
   ESP.wdtEnable(30000);
+  Serial.println("Reading EEPROM");
+  loadSettingsFromEEPROM(false);
+
   pinMode(relayPin, OUTPUT);
   pinMode(LEDPin, OUTPUT);
   pinMode(buttonPin, INPUT_PULLUP);
@@ -511,14 +553,11 @@ void setup() {
   if (GDevtype == 2 || GDevtype == 3 ) {
     pixels.begin(); // This initializes the NeoPixel library.
   }
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
   Serial.println("Startup");
   // read eeprom for ssid and pass
 
 
-  Serial.println("Reading EEPROM");
-  loadSettingsFromEEPROM(false);
+
   String esid = Gqsid;
   Serial.print("SSID: ");
   Serial.println(esid);
@@ -564,11 +603,7 @@ void setup() {
       Serial.println("");
       Serial.println("WiFi connected");
 
-
-      String ESPID = String(ESP.getChipId());
-      Host += ESPID.substring(4);
-      const char* MHost = (Host).c_str();
-      MDNS.begin(MHost);
+      MDNS.begin((String(Gdevname)).c_str());
 
 
       ArduinoOTA.setHostname((String(Gdevname)).c_str());
@@ -629,6 +664,13 @@ void setup() {
         server.sendContent(content);
       });
 
+      server.on("/checkForUpdates", [&]() {
+        checkForUpdates();
+        content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
+        server.sendContent(content);
+      });
+
+
       if (GAlexa) {
 
         server.on("/setup.xml", [&]() {
@@ -679,7 +721,7 @@ void setup() {
       Serial.println ( "HTTP server started" );
       MDNS.addService("http", "tcp", 80);
       Serial.print("DNS Hostname: ");
-      Serial.println(MHost);
+      Serial.println((String(Gdevname)).c_str());
 
       if (GMQTT) {
 
@@ -701,70 +743,71 @@ void setup() {
       }
       return;
     }
-  }
-  Serial.print("Configuring access point...");
-  /* You can remove the password parameter if you want the AP to be open. */
-  String NewSSID = "AtomicSmart";
-  String ESPID = String(ESP.getChipId());
-  NewSSID += ESPID.substring(4);
-  const char* ssidAP = (NewSSID).c_str();
+  } else {
+    Serial.print("Configuring access point...");
+    /* You can remove the password parameter if you want the AP to be open. */
+    String NewSSID = "AtomicSmart";
+    String ESPID = String(ESP.getChipId());
+    NewSSID += ESPID.substring(4);
+    const char* ssidAP = (NewSSID).c_str();
 
-  String NewPass = "welcomehome";
-  const char* passAP = (NewPass).c_str();
+    String NewPass = "welcomehome";
+    const char* passAP = (NewPass).c_str();
 
-  WiFi.softAP(ssidAP, passAP);
+    WiFi.softAP(ssidAP, passAP);
 
-  IPAddress myIP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(myIP);
-  Serial.print("SSID:");
-  Serial.println(ssidAP);
+    IPAddress myIP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(myIP);
+    Serial.print("SSID:");
+    Serial.println(ssidAP);
 
 
-  //  String ESPID = String(ESP.getChipId());
-  Host += ESPID.substring(4);
-  const char* MHost = (Host).c_str();
-  MDNS.begin(MHost);
-  MDNS.addService("http", "tcp", 80);
+    //  String ESPID = String(ESP.getChipId());
+    Host += ESPID.substring(4);
+    const char* MHost = (Host).c_str();
+    MDNS.begin(MHost);
+    MDNS.addService("http", "tcp", 80);
 
-  server.on("/", handleRoot);
-  server.on("/factoryreset", []() {
-    if (server.arg("reset")) {
-      Serial.println("clearing eeprom");
-      for (int i = 0; i < 512; ++i) {
-        EEPROM.write(i, 0);
+    server.on("/", handleRoot);
+    server.on("/factoryreset", []() {
+      if (server.arg("reset")) {
+        Serial.println("clearing eeprom");
+        for (int i = 0; i < 512; ++i) {
+          EEPROM.write(i, 0);
+        }
+        EEPROM.commit();
+        content = HTMLhead;
+        content += "<h3>Please Restart the Device </h3></body></html>";
+        server.sendContent(content);
+
       }
-      EEPROM.commit();
-      content = HTMLhead;
-      content += "<h3>Please Restart the Device </h3></body></html>";
-      server.sendContent(content);
+    });
+    server.on("/setting", handlesettings);
+
+    if (GAlexa) {
+
+      server.on("/setup.xml", [&]() {
+        handleSetupXml();
+      });
+
+      server.on("/upnp/control/basicevent1", [&]() {
+        handleUpnpControl();
+      });
+
+      server.on("/eventservice.xml", [&]() {
+        handleEventservice();
+      });
 
     }
-  });
-  server.on("/setting", handlesettings);
-
-  if (GAlexa) {
-
-    server.on("/setup.xml", [&]() {
-      handleSetupXml();
-    });
-
-    server.on("/upnp/control/basicevent1", [&]() {
-      handleUpnpControl();
-    });
-
-    server.on("/eventservice.xml", [&]() {
-      handleEventservice();
-    });
-
+    httpUpdater.setup(&server, update_path, update_username, update_password);
+    server.begin();
+    Serial.println("HTTP server started");
+    MDNS.addService("http", "tcp", 80);
+    Serial.print("DNS Hostname: ");
+    Serial.println(MHost);
+    APmode = true;
   }
-  httpUpdater.setup(&server, update_path, update_username, update_password);
-  server.begin();
-  Serial.println("HTTP server started");
-  MDNS.addService("http", "tcp", 80);
-  Serial.print("DNS Hostname: ");
-  Serial.println(MHost);
-  APmode = true;
 }
 
 bool testWifi(void) {
@@ -844,6 +887,18 @@ void loop() {
   ArduinoOTA.handle();
   server.handleClient();
 
+
+  if (Gautoupdate) {
+    unsigned long autoupdatecurrentMillis = millis();
+
+    if (autoupdatecurrentMillis - autoupdatepresspreviousMillis > autoupdateinterval || firstrunAU) {
+      firstrunAU = false;
+      autoupdatepresspreviousMillis = autoupdatecurrentMillis;
+      checkForUpdates();
+    }
+  }
+
+
   if (!GLED) {
     digitalWrite(LEDPin, HIGH);
   }
@@ -882,6 +937,9 @@ void loop() {
       espclient.publish(("openhab/in/" + Gdevname + "/state").c_str(), "ON");
       Serial.println("DoorBell Pressed");
       lastDBellState = DBellState;
+      digitalWrite(LEDPin, LOW);
+      delay(1000);
+      digitalWrite(LEDPin, HIGH);
     }
   }
   if (ignoreserver) {
@@ -1061,7 +1119,7 @@ void loadSettingsFromEEPROM(bool first)
   GLED = EEPROM.read(259);
   GNeoPixel = EEPROM.read(260);
   GDevtype = EEPROM.read(269);
-
+  Gautoupdate = EEPROM.read(270);
 
   GPixelcolor = "";
   for (int i = 261; i < 268; ++i)
@@ -1258,4 +1316,74 @@ void serverLoop() {
       }
     }
   }
+}
+
+
+String getMAC()
+{
+  uint8_t mac[6];
+  char result[14];
+
+  snprintf( result, sizeof( result ), "%02x%02x%02x%02x%02x%02x", mac[ 0 ], mac[ 1 ], mac[ 2 ], mac[ 3 ], mac[ 4 ], mac[ 5 ] );
+
+  return String( result );
+}
+
+void checkForUpdates() {
+  String mac = String(ESP.getChipId());
+  String fwURL = String( fwUrlBase );
+  fwURL.concat( "AtomicSmart" );
+  String fwVersionURL = fwURL;
+  fwVersionURL.concat( ".version" );
+
+  Serial.println( "Checking for firmware updates." );
+  Serial.print( "MAC address: " );
+  Serial.println( String(mac) );
+  Serial.print( "Firmware version URL: " );
+  Serial.println( fwVersionURL );
+
+  HTTPClient httpClient;
+  httpClient.begin( fwVersionURL );
+  int httpCode = httpClient.GET();
+  if ( httpCode == 200 ) {
+    String newFWVersion = httpClient.getString();
+
+    Serial.print( "Current firmware version: " );
+    Serial.println( FW_VERSION );
+    Serial.print( "Available firmware version: " );
+    Serial.println( newFWVersion );
+
+
+
+    int newVersion = newFWVersion.toInt();
+
+    if ( newVersion > FW_VERSION ) {
+      Serial.println( "Preparing to update" );
+      content = HTMLhead;
+      content += "<h3>Updating. Please wait... </h3></body></html>";
+      server.sendContent(content);
+
+      String fwImageURL = fwURL;
+      fwImageURL.concat( ".bin" );
+      t_httpUpdate_return ret = ESPhttpUpdate.update( fwImageURL );
+
+      switch (ret) {
+        case HTTP_UPDATE_FAILED:
+          Serial.printf("HTTP_UPDATE_FAILD Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+          break;
+
+        case HTTP_UPDATE_NO_UPDATES:
+          Serial.println("HTTP_UPDATE_NO_UPDATES");
+          break;
+      }
+    }
+    else {
+      Serial.println( "Already on latest version" );
+    }
+  }
+  else {
+    Serial.print( "Firmware version check failed, got HTTP response code " );
+    Serial.println( httpCode );
+  }
+  httpClient.end();
 }
