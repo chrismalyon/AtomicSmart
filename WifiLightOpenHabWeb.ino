@@ -17,9 +17,28 @@
 #define OLED_RESET 0  // GPIO0
 Adafruit_SSD1306 display(OLED_RESET);
 
-const int FW_VERSION = 1009;
+const int FW_VERSION = 1018;
 
-const char* fwUrlBase = "http://www.UPDATESERVER.co.uk/atomicsmart/";
+const char* fwUrlBase = "http://www.malyon.co.uk/atomicsmart/";
+
+byte sensorInterrupt = D5;
+float calibrationFactor = 4.5;
+
+volatile byte pulseCount;
+float flowRate;
+unsigned int flowMilliLitres;
+unsigned long totalMilliLitres;
+
+volatile byte oldpulseCount;
+float oldflowRate;
+unsigned int oldflowMilliLitres;
+unsigned long oldtotalMilliLitres;
+
+boolean liquidflowing = false;
+
+
+unsigned long oldTime;
+
 
 #define ONE_WIRE_BUS D2
 OneWire ds(ONE_WIRE_BUS);
@@ -28,10 +47,12 @@ IPAddress ipMulti(239, 255, 255, 250);
 const unsigned int portMulti = 1900;
 char packetBuffer[512];
 
+
 #define PIN            D6
 #define NUMPIXELS      2
 
 WiFiUDP UDP;
+
 
 Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
@@ -51,6 +72,8 @@ ESP8266HTTPUpdateServer httpUpdater;
 unsigned long last_interrupt_time = 0;
 
 String Mqttconnectionstatus = "";
+int mqttreconnecttrycount = 0;
+
 
 boolean APmode = false;
 
@@ -79,7 +102,7 @@ boolean Gautoupdate = true;
 long Gcelsius = 0.00;
 
 long mqttpreviousMillis = 0;
-long mqttinterval = 10000;
+long mqttinterval = 500;
 
 long buttonpresspreviousMillis = 0;
 long buttonpressinterval = 3000;
@@ -305,11 +328,11 @@ void handlesettings() {
     Serial.println("Sending 404");
   }
 
-  content = HTMLhead;
-  content += "<h3>Please Restart the Device </h3></body></html>";
+  content = HTMLheadref;
+  content += "<h3>Please wait while Device Restarts</h3></body></html>";
   server.sendContent(content);
-  //        digitalWrite(D3,HIGH);
-  //ESP.reset();
+  delay(1000);
+  ESP.restart();
 }
 
 void handleRoot() {
@@ -359,6 +382,13 @@ void handleRoot() {
     messageBody += "selected";
   }
   messageBody += ">Thermostat</option>";
+
+  messageBody += "<option value=\"5\"";
+  if (GDevtype == 5) {
+    messageBody += "selected";
+  }
+  messageBody += ">Flowmeter</option>";
+
   messageBody += "</select></td></tr>";
 
 
@@ -397,6 +427,9 @@ void handleRoot() {
   messageBody += "<tr><td align=\"centre\"><label>Device Name: </label></td><td align=\"centre\"><input name='devname' length=32 value='";
   messageBody += Gdevname;
   messageBody += "' required></td></tr>";
+
+
+
 
   if (GDevtype == 2 || GDevtype == 1 ) {
     messageBody += "<tr><td>Enable Alexa Support:</td><td>";
@@ -451,7 +484,12 @@ void handleRoot() {
 
 
   messageBody += "<tr><td></td></tr>";
-  messageBody += "<tr><td><form method='get' action='factoryreset'><label>Factory Reset: </label><input type='hidden' name='reset' value='true'></td><td><input type='button' onClick=\"confSubmit(this.form);\" value='Reset'></form><br></td></tr></table></div>";
+  messageBody += "<tr><td><form method='get' action='factoryreset'><label>Factory Reset: </label><input type='hidden' name='reset' value='true'></td><td><input type='button' onClick=\"confSubmit(this.form);\" value='Reset'></form><br></td>";
+
+  messageBody += "<tr><td><form method='get' action='mqttreconnect'><input type='submit' value='Reconnect'></form></td>";
+  messageBody += "<td><form method='get' action='reboot'><input type='submit' value='Restart'></form></td>";
+
+  messageBody += "</tr></table></div>";
 
   messageBody += "<div id=\"Home\" class=\"tabcontent\"><h3>Home</h3>";
   if (GDevtype == 1 || GDevtype == 2) {
@@ -472,6 +510,13 @@ void handleRoot() {
     messageBody += Gcelsius;
     messageBody += "&deg<br>";
   }
+
+  else if (GDevtype == 5) {
+    messageBody += "Total liquid: ";
+    messageBody += totalMilliLitres;
+    messageBody += "mL<br>";
+  }
+
 
   messageBody += "</div>";
 
@@ -556,7 +601,15 @@ void setup() {
   Serial.println("Startup");
   // read eeprom for ssid and pass
 
+  pulseCount        = 0;
+  flowRate          = 0.0;
+  flowMilliLitres   = 0;
+  totalMilliLitres  = 0;
+  oldTime           = 0;
 
+  if (GDevtype == 5) {
+    attachInterrupt(sensorInterrupt, pulseCounter, FALLING);
+  }
 
   String esid = Gqsid;
   Serial.print("SSID: ");
@@ -591,6 +644,8 @@ void setup() {
   persistent_uuid = "Socket-1_0-" + serial + "-80";
 
   if ( esid.length() > 1 ) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
     WiFi.begin(esid.c_str(), epass.c_str());
     if (testWifi()) {
 
@@ -630,7 +685,15 @@ void setup() {
       Serial.println(WiFi.localIP());
 
 
+      server.on ( "/mqttreconnect", reconnect );
 
+      server.on( "/reboot", []() {
+        content = HTMLhead;
+        content += "<h3 style=\"color:#45BC00;\">Restarting Device </h3></body></html>";
+        server.sendContent(content);
+        delay(1000);
+        ESP.restart();
+      });
 
       server.on ( "/", handleRoot );
       server.on ( "/inline", []() {
@@ -742,72 +805,80 @@ void setup() {
         }
       }
       return;
+    } else {
+      setupAP();
     }
   } else {
-    Serial.print("Configuring access point...");
-    /* You can remove the password parameter if you want the AP to be open. */
-    String NewSSID = "AtomicSmart";
-    String ESPID = String(ESP.getChipId());
-    NewSSID += ESPID.substring(4);
-    const char* ssidAP = (NewSSID).c_str();
+    setupAP();
+  }
 
-    String NewPass = "welcomehome";
-    const char* passAP = (NewPass).c_str();
+}
 
-    WiFi.softAP(ssidAP, passAP);
+void setupAP() {
 
-    IPAddress myIP = WiFi.softAPIP();
-    Serial.print("AP IP address: ");
-    Serial.println(myIP);
-    Serial.print("SSID:");
-    Serial.println(ssidAP);
+  Serial.print("Configuring access point...");
+  /* You can remove the password parameter if you want the AP to be open. */
+  String NewSSID = "AtomicSmart";
+  String ESPID = String(ESP.getChipId());
+  NewSSID += ESPID.substring(4);
+  const char* ssidAP = (NewSSID).c_str();
+
+  String NewPass = "welcomehome";
+  const char* passAP = (NewPass).c_str();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssidAP, passAP);
+
+  IPAddress myIP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(myIP);
+  Serial.print("SSID:");
+  Serial.println(ssidAP);
 
 
-    //  String ESPID = String(ESP.getChipId());
-    Host += ESPID.substring(4);
-    const char* MHost = (Host).c_str();
-    MDNS.begin(MHost);
-    MDNS.addService("http", "tcp", 80);
+  //  String ESPID = String(ESP.getChipId());
+  Host += ESPID.substring(4);
+  const char* MHost = (Host).c_str();
+  MDNS.begin(MHost);
+  MDNS.addService("http", "tcp", 80);
 
-    server.on("/", handleRoot);
-    server.on("/factoryreset", []() {
-      if (server.arg("reset")) {
-        Serial.println("clearing eeprom");
-        for (int i = 0; i < 512; ++i) {
-          EEPROM.write(i, 0);
-        }
-        EEPROM.commit();
-        content = HTMLhead;
-        content += "<h3>Please Restart the Device </h3></body></html>";
-        server.sendContent(content);
-
+  server.on("/", handleRoot);
+  server.on("/factoryreset", []() {
+    if (server.arg("reset")) {
+      Serial.println("clearing eeprom");
+      for (int i = 0; i < 512; ++i) {
+        EEPROM.write(i, 0);
       }
-    });
-    server.on("/setting", handlesettings);
-
-    if (GAlexa) {
-
-      server.on("/setup.xml", [&]() {
-        handleSetupXml();
-      });
-
-      server.on("/upnp/control/basicevent1", [&]() {
-        handleUpnpControl();
-      });
-
-      server.on("/eventservice.xml", [&]() {
-        handleEventservice();
-      });
+      EEPROM.commit();
+      content = HTMLhead;
+      content += "<h3>Please Restart the Device </h3></body></html>";
+      server.sendContent(content);
 
     }
-    httpUpdater.setup(&server, update_path, update_username, update_password);
-    server.begin();
-    Serial.println("HTTP server started");
-    MDNS.addService("http", "tcp", 80);
-    Serial.print("DNS Hostname: ");
-    Serial.println(MHost);
-    APmode = true;
+  });
+  server.on("/setting", handlesettings);
+
+  if (GAlexa) {
+
+    server.on("/setup.xml", [&]() {
+      handleSetupXml();
+    });
+
+    server.on("/upnp/control/basicevent1", [&]() {
+      handleUpnpControl();
+    });
+
+    server.on("/eventservice.xml", [&]() {
+      handleEventservice();
+    });
+
   }
+  httpUpdater.setup(&server, update_path, update_username, update_password);
+  server.begin();
+  Serial.println("HTTP server started");
+  MDNS.addService("http", "tcp", 80);
+  Serial.print("DNS Hostname: ");
+  Serial.println(MHost);
+  APmode = true;
 }
 
 bool testWifi(void) {
@@ -828,6 +899,7 @@ bool testWifi(void) {
 
 void reconnect() {
   // Loop until we're reconnected
+  espclient.disconnect();
   if (millis() - mqttpreviousMillis > mqttinterval || firstrun) {
     mqttpreviousMillis = millis();
     firstrun = false;
@@ -842,10 +914,14 @@ void reconnect() {
       espclient.subscribe(("openhab/out/" + Gdevname + "/command").c_str());
       Mqttconnectionstatus = "Connected";
       Serial.println("Connected");
-
+      mqttreconnecttrycount = 0;
     } else {
+      mqttreconnecttrycount += 1;
       Mqttconnectionstatus = "Failed to Connect";
       Serial.println("Failed to Connect");
+      if (mqttreconnecttrycount > 10) {
+        ESP.restart();
+      }
     }
   }
 }
@@ -881,6 +957,7 @@ void turnOffRelay(bool report) {
 
 void loop() {
   ESP.wdtFeed();
+
   if (GMQTT) {
     espclient.loop();
   }
@@ -895,6 +972,80 @@ void loop() {
       firstrunAU = false;
       autoupdatepresspreviousMillis = autoupdatecurrentMillis;
       checkForUpdates();
+    }
+  }
+
+  if (GDevtype == 5) {
+    if ((millis() - oldTime) > 1000)   // Only process counters once per second
+    {
+      // Disable the interrupt while calculating flow rate and sending the value to
+      // the host
+      detachInterrupt(sensorInterrupt);
+
+      // Because this loop may not complete in exactly 1 second intervals we calculate
+      // the number of milliseconds that have passed since the last execution and use
+      // that to scale the output. We also apply the calibrationFactor to scale the output
+      // based on the number of pulses per second per units of measure (litres/minute in
+      // this case) coming from the sensor.
+      flowRate = ((1000.0 / (millis() - oldTime)) * pulseCount) / calibrationFactor;
+
+      // Note the time this processing pass was executed. Note that because we've
+      // disabled interrupts the millis() function won't actually be incrementing right
+      // at this point, but it will still return the value it was set to just before
+      // interrupts went away.
+      oldTime = millis();
+
+      // Divide the flow rate in litres/minute by 60 to determine how many litres have
+      // passed through the sensor in this 1 second interval, then multiply by 1000 to
+      // convert to millilitres.
+      flowMilliLitres = (flowRate / 60) * 1000;
+
+      // Add the millilitres passed in this second to the cumulative total
+      totalMilliLitres += flowMilliLitres;
+
+      unsigned int frac;
+
+      // Print the flow rate for this second in litres / minute
+      Serial.print("Flow rate: ");
+      Serial.print(int(flowRate));  // Print the integer part of the variable
+      Serial.print(".");             // Print the decimal point
+      // Determine the fractional part. The 10 multiplier gives us 1 decimal place.
+      frac = (flowRate - int(flowRate)) * 10;
+      Serial.print(frac, DEC) ;      // Print the fractional part of the variable
+      Serial.print("L/min");
+      // Print the number of litres flowed in this second
+      Serial.print("  Current Liquid Flowing: ");             // Output separator
+      Serial.print(flowMilliLitres);
+      Serial.print("mL/Sec");
+
+      // Print the cumulative total of litres flowed since starting
+      Serial.print("  Output Liquid Quantity: ");             // Output separator
+      Serial.print(totalMilliLitres);
+      Serial.println("mL");
+
+      // Reset the pulse counter so we can start incrementing again
+      pulseCount = 0;
+
+      // Enable the interrupt again now that we've finished sending output
+      attachInterrupt(sensorInterrupt, pulseCounter, FALLING);
+
+
+      if (frac > 0.00 ) {
+        //        EEPROMWritelong(271, totalMilliLitres);
+        liquidflowing = true;
+        espclient.publish(("openhab/out/" + Gdevname + "flowRate/state").c_str(), String(flowRate).c_str());
+        espclient.publish(("openhab/out/" + Gdevname + "flowMilliLitres/state").c_str(), String(flowMilliLitres).c_str());
+        espclient.publish(("openhab/out/" + Gdevname + "totalMilliLitres/state").c_str(), String(totalMilliLitres).c_str());
+        oldpulseCount = pulseCount;
+      } else {
+        if (liquidflowing) {
+          espclient.publish(("openhab/out/" + Gdevname + "flowRate/state").c_str(), String(flowRate).c_str());
+          espclient.publish(("openhab/out/" + Gdevname + "flowMilliLitres/state").c_str(), String(flowMilliLitres).c_str());
+          espclient.publish(("openhab/out/" + Gdevname + "totalMilliLitres/state").c_str(), String(totalMilliLitres).c_str());
+          liquidflowing = false;
+        }
+      }
+
     }
   }
 
@@ -934,6 +1085,7 @@ void loop() {
   }
   if (GDevtype == 3) {
     if ( DBellState != lastDBellState) {
+
       espclient.publish(("openhab/in/" + Gdevname + "/state").c_str(), "ON");
       Serial.println("DoorBell Pressed");
       lastDBellState = DBellState;
@@ -961,10 +1113,14 @@ void loop() {
       }
     }
     if (WiFi.status() != WL_CONNECTED) {
-      WiFi.begin(ssid, password);
+      Serial.println("Wifi Disconnected...");
+      Serial.println("Reconnecting Wifi...");
+      WiFi.begin((Gqsid).c_str(), (Gqpass).c_str());
       while (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
         delay(500);
       }
+      reconnect();
     }
     delay(25);
   }
@@ -1120,6 +1276,14 @@ void loadSettingsFromEEPROM(bool first)
   GNeoPixel = EEPROM.read(260);
   GDevtype = EEPROM.read(269);
   Gautoupdate = EEPROM.read(270);
+
+  totalMilliLitres = 0;
+  for (int i = 271; i < 303; ++i)
+  {
+    if (EEPROM.read(i) == 0) break;
+    totalMilliLitres += char(EEPROM.read(i));
+  }
+
 
   GPixelcolor = "";
   for (int i = 261; i < 268; ++i)
@@ -1306,9 +1470,9 @@ void serverLoop() {
 
     // check if this is a M-SEARCH for WeMo device
     String request = String((char *)packetBuffer);
-    // Serial.println("----------");
-    // Serial.println(request);
-    // Serial.println("-----------");
+    Serial.println("----------");
+    Serial.println(request);
+    Serial.println("-----------");
     if (request.indexOf('M-SEARCH') > 0) {
       if ((request.indexOf("urn:Belkin:device:**") > 0) || (request.indexOf("ssdp:all") > 0) || (request.indexOf("upnp:rootdevice") > 0)) {
         Serial.println("Got UDP Belkin Request..");
@@ -1386,4 +1550,41 @@ void checkForUpdates() {
     Serial.println( httpCode );
   }
   httpClient.end();
+}
+
+void pulseCounter()
+{
+  // Increment the pulse counter
+  pulseCount++;
+}
+
+
+void EEPROMWritelong(int address, long value)
+{
+  //Decomposition from a long to 4 bytes by using bitshift.
+  //One = Most significant -> Four = Least significant byte
+  byte four = (value & 0xFF);
+  byte three = ((value >> 8) & 0xFF);
+  byte two = ((value >> 16) & 0xFF);
+  byte one = ((value >> 24) & 0xFF);
+  byte aone = ((value >> 32) & 0xFF);
+  byte bone = ((value >> 40) & 0xFF);
+  byte cone = ((value >> 48) & 0xFF);
+  byte done = ((value >> 56) & 0xFF);
+  byte eone = ((value >> 64) & 0xFF);
+  byte fone = ((value >> 72) & 0xFF);
+
+
+
+  //Write the 4 bytes into the eeprom memory.
+  EEPROM.write(address, four);
+  EEPROM.write(address + 1, three);
+  EEPROM.write(address + 2, two);
+  EEPROM.write(address + 3, one);
+  EEPROM.write(address + 4, aone);
+  EEPROM.write(address + 5, bone);
+  EEPROM.write(address + 6, cone);
+  EEPROM.write(address + 7, done);
+  EEPROM.write(address + 8, eone);
+  EEPROM.write(address + 9, fone);
 }
