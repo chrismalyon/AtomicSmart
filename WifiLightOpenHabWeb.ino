@@ -1,3 +1,4 @@
+#include <EmonLib.h>
 #include <OneWire.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
@@ -13,16 +14,23 @@
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+EnergyMonitor emon1;             // Create an instance
+
+
+
 
 #define OLED_RESET 0  // GPIO0
 Adafruit_SSD1306 display(OLED_RESET);
 
-const int FW_VERSION = 1018;
+const int FW_VERSION = 1020;
 
 const char* fwUrlBase = "http://www.malyon.co.uk/atomicsmart/";
 
 byte sensorInterrupt = D5;
 float calibrationFactor = 4.5;
+
+//emon1.current(1, 111.1);       // Current: input pin, calibration.
+double Irms = 0.00;
 
 volatile byte pulseCount;
 float flowRate;
@@ -98,11 +106,15 @@ boolean GNeoPixel = false;
 String GPixelcolor = "#45bc00";
 int GDevtype = 1;
 boolean Gautoupdate = true;
+double PowerFactor = 230.0;
 
 long Gcelsius = 0.00;
 
 long mqttpreviousMillis = 0;
 long mqttinterval = 500;
+
+long PowerpreviousMillis = 0;
+long Powerinterval = 5000;
 
 long buttonpresspreviousMillis = 0;
 long buttonpressinterval = 3000;
@@ -185,8 +197,12 @@ void buttonPress()
 {
   if (millis() - last_interrupt_time > 1000)
   {
+
+
+
     ignoreserver = true;
     last_interrupt_time = millis();
+
     Serial.println("Button Pressed");
     if (GDevtype == 2) {
       if (relayState == LOW) {
@@ -209,6 +225,8 @@ void buttonPress()
         DBellState = true;
       }
     }
+
+
   }
 
 
@@ -389,6 +407,14 @@ void handleRoot() {
   }
   messageBody += ">Flowmeter</option>";
 
+
+  messageBody += "<option value=\"6\"";
+  if (GDevtype == 6) {
+    messageBody += "selected";
+  }
+  messageBody += ">Powermeter</option>";
+
+
   messageBody += "</select></td></tr>";
 
 
@@ -516,6 +542,11 @@ void handleRoot() {
     messageBody += totalMilliLitres;
     messageBody += "mL<br>";
   }
+  else if (GDevtype == 6) {
+    messageBody += "Power: ";
+    messageBody += Irms * PowerFactor;
+    messageBody += "W<br>";
+  }
 
 
   messageBody += "</div>";
@@ -610,6 +641,13 @@ void setup() {
   if (GDevtype == 5) {
     attachInterrupt(sensorInterrupt, pulseCounter, FALLING);
   }
+
+
+  if (GDevtype == 6) {
+    emon1.current(A0, 111.1);
+  }
+
+
 
   String esid = Gqsid;
   Serial.print("SSID: ");
@@ -975,6 +1013,8 @@ void loop() {
     }
   }
 
+ 
+
   if (GDevtype == 5) {
     if ((millis() - oldTime) > 1000)   // Only process counters once per second
     {
@@ -1049,6 +1089,13 @@ void loop() {
     }
   }
 
+ if (GDevtype == 6) {
+    if (millis() - PowerpreviousMillis > Powerinterval) {
+      Irms = emon1.calcIrms(1480);  // Calculate Irms only
+      espclient.publish(("openhab/out/" + Gdevname + "power/state").c_str(), String(Irms * PowerFactor).c_str());
+      PowerpreviousMillis = millis();
+    }
+  }
 
   if (!GLED) {
     digitalWrite(LEDPin, HIGH);
@@ -1211,7 +1258,7 @@ void loop() {
       display.println(celsius);
       display.display();
 
-      espclient.publish("openhab/out/RemoteTherm1/state", String(celsius).c_str());
+      espclient.publish(("openhab/out/" + String(Gdevname) + "/state").c_str(), String(celsius).c_str());
 
       Serial.println( String(celsius).c_str());
 
