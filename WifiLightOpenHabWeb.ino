@@ -5,6 +5,7 @@
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
 #include "htmlhead.h"
@@ -14,15 +15,28 @@
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_PN532.h>
 EnergyMonitor emon1;             // Create an instance
 
 
+#define PN532_SCK (D5) // (2) 
+#define PN532_MOSI (D7) // (3) 
+#define PN532_SS (D3) // (4) 
+#define PN532_MISO (D6) // (5) Adafruit_PN532 nfc (PN532_SS); 
+#define PN532_IRQ   (2)
+#define PN532_RESET (3)  // Not connected by default on the NFC Shield
+Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 
+const byte DNS_PORT = 53;
+DNSServer dnsServer;
+uint32_t Color1, Color2;  // What colors are in use
+uint16_t TotalSteps = 255;  // total number of steps in the pattern
+uint16_t Index;  // current step within the pattern
 
 #define OLED_RESET 0  // GPIO0
 Adafruit_SSD1306 display(OLED_RESET);
 
-const int FW_VERSION = 1020;
+const int FW_VERSION = 1026;
 
 const char* fwUrlBase = "http://www.malyon.co.uk/atomicsmart/";
 
@@ -56,13 +70,35 @@ const unsigned int portMulti = 1900;
 char packetBuffer[512];
 
 
-#define PIN            D6
-#define NUMPIXELS      2
+#define PIN            D2
+
 
 WiFiUDP UDP;
 
+String GPixelCount = "";
+int GPattern = 1;
+int GDevtype = 1;
 
-Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+unsigned int loadpixel(void) {
+  EEPROM.begin(512);
+  delay(10);
+  GPattern = EEPROM.read(304);
+  GPixelCount = "";
+  for (int i = 305; i < 310; ++i)
+  {
+    if (EEPROM.read(i) == 0) break;
+    GPixelCount += char(EEPROM.read(i));
+  }
+
+  return GPixelCount.toInt();
+}
+
+
+
+
+#define NUMPIXELS      250
+
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(loadpixel(), PIN, NEO_GRB + NEO_KHZ800);
 
 const int relayPin = D1;
 const int buttonPin = D2;
@@ -104,7 +140,12 @@ boolean GMQTT = false;
 boolean GLED = false;
 boolean GNeoPixel = false;
 String GPixelcolor = "#45bc00";
-int GDevtype = 1;
+
+
+String LastTag = "";
+
+boolean TagPresent = false;
+
 boolean Gautoupdate = true;
 double PowerFactor = 230.0;
 
@@ -114,13 +155,16 @@ long mqttpreviousMillis = 0;
 long mqttinterval = 500;
 
 long PowerpreviousMillis = 0;
-long Powerinterval = 5000;
+long Powerinterval = 30000;
 
 long buttonpresspreviousMillis = 0;
 long buttonpressinterval = 3000;
 
 long autoupdatepresspreviousMillis = 0;
 long autoupdateinterval = 60000;
+
+long NFCpresspreviousMillis = 0;
+long NFCinterval = 5000;
 
 long previousMillis = 0;
 long interval = 60000;
@@ -141,7 +185,11 @@ const long togDelay = 100;  // pause for 100 milliseconds before toggling to Ope
 const long postDelay = 200;  // pause for 200 milliseconds after toggling to Open
 int value = 0;
 boolean relayState;
+boolean switchenable = true;
 boolean lastrelaystate;
+
+boolean XMasState;
+
 
 boolean DBellState;
 boolean lastDBellState;
@@ -175,22 +223,36 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (!ignoreserver) {
 
     if ( strcmp(topic, ("openhab/out/" + String(Gdevname) + "/command").c_str()) == 0) {
+      if (GDevtype == 7) {
+        if (myString == "ON") {
+          Serial.println("Actioned");
+          turnOnXMas(true);
 
-      if (myString == "ON") {
-        Serial.println("Actioned");
-        turnOnRelay(false);
-      }
-      if (myString == "OFF") {
-        Serial.println("Actioned1");
-        turnOffRelay(false);
+        }
+        if (myString == "OFF") {
+          Serial.println("Actioned1");
+          turnOffXMas(true);
+          //XMasState = false;
+        }
+      } else {
+        if (myString == "ON") {
+          Serial.println("Actioned");
+          turnOnRelay(false);
+        }
+        if (myString == "OFF") {
+          Serial.println("Actioned1");
+          turnOffRelay(false);
+        }
       }
     }
   }
 
+
+
+
   last_PayloadTime = millis();
 
 }
-
 
 void buttonPress()
 
@@ -202,31 +264,32 @@ void buttonPress()
 
     ignoreserver = true;
     last_interrupt_time = millis();
+    if (switchenable) {
 
-    Serial.println("Button Pressed");
-    if (GDevtype == 2) {
-      if (relayState == LOW) {
-        digitalWrite(relayPin, HIGH); // turn on relay with voltage HIGH
-        relayState = true;
-        if (GLED) {
-          digitalWrite(LEDPin, LOW);
+      Serial.println("Button Pressed");
+      if (GDevtype == 2) {
+        if (relayState == LOW) {
+          digitalWrite(relayPin, HIGH); // turn on relay with voltage HIGH
+          relayState = true;
+          if (GLED) {
+            digitalWrite(LEDPin, LOW);
+          }
+        } else if (relayState == HIGH) {
+          digitalWrite(relayPin, LOW); // turn on relay with voltage HIGH
+          relayState = false;
+          if (GLED) {
+            digitalWrite(LEDPin, HIGH);
+          }
         }
-      } else if (relayState == HIGH) {
-        digitalWrite(relayPin, LOW); // turn on relay with voltage HIGH
-        relayState = false;
-        if (GLED) {
-          digitalWrite(LEDPin, HIGH);
+      } if (GDevtype == 3) {
+        if (DBellState == true) {
+          DBellState = false;
+        } else if (DBellState == false) {
+          DBellState = true;
         }
       }
-    } if (GDevtype == 3) {
-      if (DBellState == true) {
-        DBellState = false;
-      } else if (DBellState == false) {
-        DBellState = true;
-      }
+
     }
-
-
   }
 
 
@@ -369,6 +432,11 @@ void handleRoot() {
   if (GNeoPixel) {
     messageBody += "<button class=\"tablinks\" onclick=\"openTab(event, 'NeoPixel')\">NeoPixel</button>";
   }
+
+  if (GDevtype == 7) {
+    messageBody += "<button class=\"tablinks\" onclick=\"openTab(event, 'XMas')\">XMas</button>";
+  }
+
   messageBody += "<button class=\"tablinks\" onclick=\"openTab(event, 'Update')\">Update</button>";
   messageBody += "</div>";
 
@@ -414,6 +482,17 @@ void handleRoot() {
   }
   messageBody += ">Powermeter</option>";
 
+  messageBody += "<option value=\"7\"";
+  if (GDevtype == 7) {
+    messageBody += "selected";
+  }
+  messageBody += ">Xmas Lights</option>";
+
+  messageBody += "<option value=\"8\"";
+  if (GDevtype == 8) {
+    messageBody += "selected";
+  }
+  messageBody += ">NFC Reader</option>";
 
   messageBody += "</select></td></tr>";
 
@@ -469,7 +548,7 @@ void handleRoot() {
   } else {
     messageBody += "<input type=\"hidden\" name=\"Alexa\" value=\"0\">";
   }
-  if (GDevtype == 2 || GDevtype == 3 ) {
+  if (GDevtype == 3 ) {
     messageBody += "<td>Enable Neopixel:</td><td>";
 
     if (GNeoPixel) {
@@ -529,6 +608,18 @@ void handleRoot() {
     }
     messageBody += "<span class=\"slider round\"></span>";
     messageBody += "</label><input type='submit'></form>";
+
+    messageBody += "<form method='get' action='switchupdate'><label>Switch Enable: </label>";
+    messageBody += "<label class=\"switch\">";
+    //messageBody += "<input name='switchstate' type=\"checkbox\" value=\"1\">";
+    if (switchenable) {
+      messageBody += "<input type=\"hidden\" name=\"switchenable\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
+    } else {
+      messageBody += "<input type=\"hidden\" name=\"switchenable\" value=\"0\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\">";
+    }
+    messageBody += "<span class=\"slider round\"></span>";
+    messageBody += "</label><input type='submit'></form>";
+
   } else if (GDevtype == 3) {
     messageBody += "Device is in Doorbell Mode";
   } else if (GDevtype == 4) {
@@ -547,6 +638,29 @@ void handleRoot() {
     messageBody += Irms * PowerFactor;
     messageBody += "W<br>";
   }
+  else if (GDevtype == 7) {
+    messageBody += "<form method='get' action='XMasaction'><label>XMas State: </label>";
+    messageBody += "<label class=\"switch\">";
+    //messageBody += "<input name='switchstState' type=\"checkbox\" value=\"1\">";
+    if (XMasState) {
+      messageBody += "<input type=\"hidden\" name=\"XMasState\" value=\"1\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\" checked>";
+    } else {
+      messageBody += "<input type=\"hidden\" name=\"XMasState\" value=\"0\"><input type=\"checkbox\" onclick=\"this.previousSibling.value=1-this.previousSibling.value\">";
+    }
+    messageBody += "<span class=\"slider round\"></span>";
+    messageBody += "</label><input type='submit'></form><br>";
+    messageBody += pixels.numPixels();
+
+  }
+  else if (GDevtype == 8) {
+    messageBody += "Last Tag Scanned: ";
+    messageBody += LastTag;
+    messageBody += "<br>";
+
+  }
+
+
+
 
 
   messageBody += "</div>";
@@ -567,6 +681,33 @@ void handleRoot() {
   messageBody += "<input type=\"color\" name=\"pixelcolor\" value=\"";
   messageBody += GPixelcolor;
   messageBody += "\"></td>";
+  messageBody += "<td><input type=\"submit\"></td></tr>";
+  messageBody += "</form></table></div>";
+
+
+  messageBody += "<div id=\"XMas\" class=\"tabcontent\"><h3>XMas</h3>";
+  messageBody += "<form method='get' action='XMas'>";
+  messageBody += "<table><tr><td>";
+
+  messageBody += "Pattern:</td><td>";
+  messageBody += "<select name=\"Pattern\">";
+  messageBody += "<option value=\"1\"";
+  if (GPattern == 1) {
+    messageBody += "selected";
+  }
+  messageBody += ">XMas Chase</option>";
+
+  messageBody += "<option value=\"2\"";
+  if (GPattern == 2) {
+    messageBody += "selected";
+  }
+  messageBody += ">XMas Flash</option>";
+
+  messageBody += "</select></td></tr>";
+  messageBody += "<tr><td align=\"centre\"><label>Number of Pixels: </label></td><td align=\"centre\"><input name='pixelcount' length=32 value='";
+  messageBody += GPixelCount;
+  messageBody += "'></td><tr>";
+
   messageBody += "<td><input type=\"submit\"></td></tr>";
   messageBody += "</form></table></div>";
 
@@ -614,19 +755,21 @@ void handleNotFound() {
 
 void setup() {
   Serial.begin(115200);
-  EEPROM.begin(512);
-  delay(10);
+  //  EEPROM.begin(512);
+  //  delay(10);
   ESP.wdtEnable(30000);
   Serial.println("Reading EEPROM");
   loadSettingsFromEEPROM(false);
 
   pinMode(relayPin, OUTPUT);
   pinMode(LEDPin, OUTPUT);
-  pinMode(buttonPin, INPUT_PULLUP);
+  if (GDevtype == 2 || GDevtype == 3 ) {
+    pinMode(buttonPin, INPUT_PULLUP);
+  }
   pinMode(D3, OUTPUT);
 
   digitalWrite(LEDPin, HIGH);
-  if (GDevtype == 2 || GDevtype == 3 ) {
+  if (GDevtype == 3 || GDevtype == 7 ) {
     pixels.begin(); // This initializes the NeoPixel library.
   }
   Serial.println("Startup");
@@ -670,6 +813,10 @@ void setup() {
     display.println("AtomicSmart");
     display.println(millis());
     display.display();
+  }
+
+  if (GDevtype == 8) {
+    nfc.begin();
   }
 
   uint32_t uniqueSwitchId = ESP.getChipId() + 80;
@@ -765,6 +912,34 @@ void setup() {
         server.sendContent(content);
       });
 
+
+
+      server.on("/XMas", [&]() {
+        int Pattern = server.arg("Pattern").toInt();
+        String TPixelCount = server.arg("pixelcount");
+
+        Serial.print("Pattern: ");
+        Serial.println(Pattern);
+        Serial.print("PixelCount: ");
+        Serial.println(server.arg("pixelcount"));
+
+        EEPROM.write(304, Pattern);
+
+        for (int i = 305; i < 310; ++i)
+        {
+          EEPROM.write(i, server.arg("pixelcount").charAt(i - 305));
+        }
+        EEPROM.commit();
+        GPattern = Pattern;
+        GPixelCount = server.arg("pixelcount").toInt();
+        content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
+        server.sendContent(content);
+      });
+
+
+
+
+
       server.on("/checkForUpdates", [&]() {
         checkForUpdates();
         content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
@@ -802,6 +977,21 @@ void setup() {
       }
       server.on("/setting", handlesettings);
 
+
+      server.on("/XMasaction", []() {
+        if (GDevtype == 7) {
+          Serial.println(server.arg("XMasState"));
+          if (server.arg("XMasState") == "1") {
+            turnOnXMas(true);
+          }
+          if (server.arg("XMasState") == "0") {
+            turnOffXMas(true);
+          }
+        }
+        content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
+        server.sendContent(content);
+      });
+
       server.on("/switchaction", []() {
         if (GDevtype == 1 || GDevtype == 2) {
           Serial.println(server.arg("switchstate"));
@@ -815,6 +1005,26 @@ void setup() {
         content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
         server.sendContent(content);
       });
+
+      server.on("/switchupdate", []() {
+        if (GDevtype == 1 || GDevtype == 2) {
+          Serial.println(server.arg("switchenable"));
+          if (server.arg("switchenable") == "1") {
+            switchenable = true;
+            EEPROM.write(300, 1);
+            EEPROM.commit();
+          }
+          if (server.arg("switchenable") == "0") {
+            switchenable = false;
+            EEPROM.write(300, 0);
+            EEPROM.commit();
+          }
+        }
+        content = "<html><head><meta http-equiv=\"refresh\" content=\"0;URL='./'\" /></head></html>";
+        server.sendContent(content);
+      });
+
+
 
       server.onNotFound ( handleNotFound );
       httpUpdater.setup(&server, update_path, update_username, update_password);
@@ -872,6 +1082,7 @@ void setupAP() {
   Serial.print("SSID:");
   Serial.println(ssidAP);
 
+  dnsServer.start(DNS_PORT, "*", myIP);
 
   //  String ESPID = String(ESP.getChipId());
   Host += ESPID.substring(4);
@@ -964,6 +1175,35 @@ void reconnect() {
   }
 }
 
+void turnOnXMas(bool report) {
+  XMasState = true;
+
+  relayState = true;
+
+  if (report) {
+    if (GMQTT) {
+      espclient.publish(("openhab/in/" + Gdevname + "/state").c_str(), "ON");
+    }
+  }
+  if (GLED) {
+    digitalWrite(LEDPin, LOW);
+  }
+}
+
+void turnOffXMas(bool report) {
+  XMasState = false;
+
+  relayState = false;
+  if (report) {
+    if (GMQTT) {
+      espclient.publish(("openhab/in/" + Gdevname + "/state").c_str(), "OFF");
+    }
+  }
+  if (GLED) {
+    digitalWrite(LEDPin, HIGH);
+  }
+}
+
 void turnOnRelay(bool report) {
   digitalWrite(relayPin, HIGH); // turn on relay with voltage HIGH
 
@@ -995,6 +1235,43 @@ void turnOffRelay(bool report) {
 
 void loop() {
   ESP.wdtFeed();
+  dnsServer.processNextRequest();
+
+  if (GDevtype == 8) {
+
+
+    uint8_t success;
+    uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  // Buffer to store the returned UID
+    uint8_t uidLength;                        // Length of the UID (4 or 7 bytes depending on ISO14443A card type)
+
+    // Wait for an NTAG203 card.  When one is found 'uid' will be populated with
+    // the UID, and uidLength will indicate the size of the UUID (normally 7)
+    success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 1000);
+
+    if (success) {
+      // Display some basic information about the card
+      Serial.println("Found an ISO14443A card");
+      Serial.print("  UID Length: "); Serial.print(uidLength, DEC); Serial.println(" bytes");
+      Serial.print("  UID Value: ");
+      nfc.PrintHex(uid, uidLength);
+      Serial.println("");
+      String NewUID = "";
+      for ( uint8_t i = 0; i < uidLength; i++) {
+        NewUID += String(uid[i], HEX);
+      }
+      Serial.println(NewUID);
+
+      unsigned long NFCcurrentMillis = millis();
+      if (NFCcurrentMillis - NFCpresspreviousMillis > NFCinterval) {
+        espclient.publish("openhab/in/NFC/state", String(NewUID).c_str());
+        LastTag = String(NewUID).c_str();
+        NFCpresspreviousMillis = NFCcurrentMillis;
+      }
+
+    }
+  }
+
+
 
   if (GMQTT) {
     espclient.loop();
@@ -1013,7 +1290,7 @@ void loop() {
     }
   }
 
- 
+
 
   if (GDevtype == 5) {
     if ((millis() - oldTime) > 1000)   // Only process counters once per second
@@ -1089,7 +1366,7 @@ void loop() {
     }
   }
 
- if (GDevtype == 6) {
+  if (GDevtype == 6) {
     if (millis() - PowerpreviousMillis > Powerinterval) {
       Irms = emon1.calcIrms(1480);  // Calculate Irms only
       espclient.publish(("openhab/out/" + Gdevname + "power/state").c_str(), String(Irms * PowerFactor).c_str());
@@ -1101,20 +1378,26 @@ void loop() {
     digitalWrite(LEDPin, HIGH);
   }
 
-  if (GDevtype == 2 || GDevtype == 3 ) {
-    if (GNeoPixel) {
-      for (int i = 0; i < NUMPIXELS; i++) {
-        // Get rid of '#' and convert it to integer
-        int number = (int) strtol( &GPixelcolor[1], NULL, 16);
-        // Split them up into r, g, b values
-        int r = number >> 16;
-        int g = number >> 8 & 0xFF;
-        int b = number & 0xFF;
-        // pixels.Color takes RGB values, from 0,0,0 up to 255,255,255
-        pixels.setPixelColor(i, pixels.Color(r, g, b)); // Moderately bright green color.
-        pixels.show(); // This sends the updated pixel color to the hardware.
-      }
+
+
+  if (GDevtype == 7) {
+    if (XMasState) {
+      //RainbowCycleUpdate();
+      //      xmas(0);
+            if (GPattern == 1) {
+              RainbowCycleUpdate();
+            }
+            if (GPattern == 2) {
+              xmas(0);
+            }
     }
+    else {
+      for (uint16_t j = 0; j < pixels.numPixels(); j++) {
+        pixels.setPixelColor(j  , 0, 0, 0); // Draw new pixel
+      }
+      pixels.show();
+    }
+
   }
 
   if (GAlexa) {
@@ -1331,6 +1614,15 @@ void loadSettingsFromEEPROM(bool first)
     totalMilliLitres += char(EEPROM.read(i));
   }
 
+  GPattern = EEPROM.read(304);
+
+  GPixelCount = "";
+  for (int i = 305; i < 310; ++i)
+  {
+    if (EEPROM.read(i) == 0) break;
+    GPixelCount += char(EEPROM.read(i));
+  }
+
 
   GPixelcolor = "";
   for (int i = 261; i < 268; ++i)
@@ -1340,6 +1632,9 @@ void loadSettingsFromEEPROM(bool first)
   }
   Serial.print("Pixel Colour: ");
   Serial.println(GPixelcolor);
+
+  switchenable = EEPROM.read(300);
+
 
 }
 
@@ -1634,4 +1929,279 @@ void EEPROMWritelong(int address, long value)
   EEPROM.write(address + 7, done);
   EEPROM.write(address + 8, eone);
   EEPROM.write(address + 9, fone);
+}
+
+static void chase(uint32_t c) {
+  for (uint16_t i = 0; i < pixels.numPixels() + 4; i++) {
+    pixels.setPixelColor(i  , c); // Draw new pixel
+    pixels.setPixelColor(i - 4, 0); // Erase pixel a few steps back
+    pixels.show();
+    delay(25);
+  }
+}
+void (*OnComplete)();  // Callback on completion of pattern
+void Increment()
+{
+
+  Index++;
+  if (Index >= TotalSteps)
+  {
+    Index = 0;
+    if (OnComplete != NULL)
+    {
+      OnComplete(); // call the comlpetion callback
+    }
+  }
+}
+
+
+uint32_t Wheel(byte WheelPos)
+{
+  WheelPos = 255 - WheelPos;
+  if (WheelPos < 85)
+  {
+    return pixels.Color(255 - WheelPos * 3, 0, WheelPos * 3);
+  }
+  else if (WheelPos < 170)
+  {
+    WheelPos -= 85;
+    return pixels.Color(0, WheelPos * 3, 255 - WheelPos * 3);
+  }
+  else
+  {
+    WheelPos -= 170;
+    return pixels.Color(WheelPos * 3, 255 - WheelPos * 3, 0);
+  }
+}
+void RainbowCycleUpdate()
+{
+  for (int i = 0; i < pixels.numPixels(); i++)
+  {
+    pixels.setPixelColor(i, Wheel(((i * 256 / pixels.numPixels()) + Index) & 255));
+  }
+  espclient.loop();
+  pixels.show();
+  Increment();
+}
+
+//Theatre-style crawling lights.
+void theaterChase(uint32_t c, uint8_t wait) {
+  for (int j = 0; j < 10; j++) { //do 10 cycles of chasing
+    for (int q = 0; q < 3; q++) {
+      for (uint16_t i = 0; i < pixels.numPixels(); i = i + 3) {
+        pixels.setPixelColor(i + q, c);  //turn every third pixel on
+      }
+      pixels.show();
+      espclient.loop();
+      delay(wait);
+
+      for (uint16_t i = 0; i < pixels.numPixels(); i = i + 3) {
+        pixels.setPixelColor(i + q, 0);      //turn every third pixel off
+      }
+    }
+  }
+}
+// Fill the dots one after the other with a color
+void colorWipe(uint32_t c, uint8_t wait) {
+  for (uint16_t i = 0; i < pixels.numPixels(); i++) {
+    pixels.setPixelColor(i, c);
+    pixels.show();
+    espclient.loop();
+    delay(wait);
+  }
+}
+
+void rainbow(uint8_t wait) {
+  uint16_t i, j;
+
+  for (j = 0; j < 256; j++) {
+    for (i = 0; i < pixels.numPixels(); i++) {
+      pixels.setPixelColor(i, Wheel((i + j) & 255));
+    }
+    espclient.loop();
+    pixels.show();
+    delay(wait);
+  }
+}
+// Slightly different, this makes the rainbow equally distributed throughout
+void rainbowCycle(uint8_t wait) {
+  uint16_t i, j;
+
+  for (j = 0; j < 256 * 5; j++) { // 5 cycles of all colors on wheel
+    for (i = 0; i < pixels.numPixels(); i++) {
+      pixels.setPixelColor(i, Wheel(((i * 256 / pixels.numPixels()) + j) & 255));
+    }
+    espclient.loop();
+    pixels.show();
+    delay(wait);
+  }
+}
+//Theatre-style crawling lights with rainbow effect
+void theaterChaseRainbow(uint8_t wait) {
+  for (int j = 0; j < 256; j++) {   // cycle all 256 colors in the wheel
+    for (int q = 0; q < 3; q++) {
+      for (uint16_t i = 0; i < pixels.numPixels(); i = i + 3) {
+        pixels.setPixelColor(i + q, Wheel( (i + j) % 255)); //turn every third pixel on
+      }
+      pixels.show();
+      espclient.loop();
+      delay(wait);
+
+      for (uint16_t i = 0; i < pixels.numPixels(); i = i + 3) {
+        pixels.setPixelColor(i + q, 0);      //turn every third pixel off
+      }
+    }
+  }
+}
+static void xmas(int c) {
+  espclient.loop();
+  int posi = 0;
+  int pixcount = 15;
+  uint32_t red = (255, 0, 0);
+  uint32_t green = (0, 255, 0);
+  uint32_t blue = (0, 0, 255);
+  theaterChase(pixels.Color(127, 127, 127), 50); // White
+  espclient.loop();
+  theaterChase(pixels.Color(0, 0, 255), 50); // Blue
+  espclient.loop();
+  colorWipe(pixels.Color(255, 0, 0), 50); // Red
+  espclient.loop();
+  colorWipe(pixels.Color(0, 255, 0), 50); // Green
+  espclient.loop();
+  colorWipe(pixels.Color(0, 0, 255), 50); // Blue
+  espclient.loop();
+  colorWipe(pixels.Color(127, 127, 127), 50); // White
+  espclient.loop();
+  for (int k = 0; k < 2; k++) {
+    for (uint16_t j = c; j < pixels.numPixels(); j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 30  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 60  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 90  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 120  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 150  , 255, 0, 0); // Draw new pixel
+
+      pixels.setPixelColor(j + 15  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 45  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 75  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 105  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 135  , 0, 255, 0); // Draw new pixel
+      pixels.show();
+      delay(25);
+    }
+
+    for (uint16_t j = c; j < pixels.numPixels(); j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 30  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 60  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 90  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 120  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j + 150  , 0, 255, 0); // Draw new pixel
+
+      pixels.setPixelColor(j + 15  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 45  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 75  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 105  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j + 135  , 255, 0, 0); // Draw new pixel
+      pixels.show();
+      delay(25);
+    }
+  }
+  delay(1000);
+  for (int k = 0; k < 2; k++) {
+    espclient.loop();
+    for (uint16_t j = 0; j < pixels.numPixels() / 2; j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+
+    }
+
+    for (uint16_t j = pixels.numPixels() / 2; j < pixels.numPixels(); j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+
+    }
+    pixels.show();
+    delay(1000);
+    for (uint16_t j = 0; j < pixels.numPixels() / 2; j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+    }
+
+    for (uint16_t j = pixels.numPixels() / 2; j < pixels.numPixels(); j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+    }
+    pixels.show();
+    delay(1000);
+  }
+
+
+  for (int k = 0; k < 2; k++) {
+    espclient.loop();
+    for (uint16_t j = 0; j < pixels.numPixels() / 4; j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+
+    }
+
+    for (uint16_t j = pixels.numPixels() / 4; j < pixels.numPixels() / 2; j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+
+    }
+    pixels.show();
+    delay(1000);
+    for (uint16_t j = pixels.numPixels() / 2; j < (pixels.numPixels() / 2) + pixels.numPixels() / 4; j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 0, 255, 0); // Draw new pixel
+    }
+
+    for (uint16_t j = (pixels.numPixels() / 2) + pixels.numPixels() / 4; j < pixels.numPixels(); j++) {
+      espclient.loop();
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+      pixels.setPixelColor(j  , 255, 0, 0); // Draw new pixel
+
+    }
+    pixels.show();
+    delay(1000);
+
+  }
 }
